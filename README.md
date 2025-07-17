@@ -17,3 +17,32 @@ The Coding Club website is a landing page for parents and children looking for a
 ## Credits
 - The code for the social media icon animations was taken from [website name](https://username2.github.io/projectname/)
 - Thanks to my mentor Rudy Matheson for his patience and support as I built out this project.
+
+
+
+
+| Tables        | Are           | Cool  |
+| ------------- |:-------------:| -----:|
+| col 3 is      | right-aligned | $1600 |
+| col 2 is      | centered      |   $12 |
+| zebra stripes | are neat      |    $1 |
+
+ **Building** | **a table** | **with markdown**
+---- | ---- | ----
+*Italic text* | **bold text** | `inline code`
+42 | 400 | 97
+
+<table border="1">
+  <tr>
+    <th>Column A</th><th>Column B</th><th>Column C</th>
+  </tr>
+  <tr>
+    <td>Apple</td><td>Red</td><td>$1</td>
+  </tr>
+  <tr>
+    <td>Banana</td><td>Yellow</td><td>$0.50</td>
+  </tr>
+  <tr>
+    <td>Grape</td><td>Purple</td><td>$2</td>
+  </tr>
+</table>
