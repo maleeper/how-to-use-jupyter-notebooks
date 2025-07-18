@@ -112,8 +112,8 @@ I need to highlight these ==very important words==.
 
 ### Subscript
 
-H~2~O
+H<sub>2</sub>O
 
 ### Superscript
 
-X^2^
+X<sup>2<sup>
