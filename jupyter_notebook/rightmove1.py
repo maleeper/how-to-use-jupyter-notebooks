@@ -3,6 +3,8 @@ import re
 import json
 import time
 from typing import List, Dict, Optional
+import argparse
+import sys
 from urllib.parse import urlparse, parse_qs
 
 import pandas as pd
@@ -26,6 +28,7 @@ PROPERTY_LINK_SELECTORS = [
     "a.propertyCard-link",
     "a.propertyCard-detailsLink",
     "a[data-test='property-card-link']",
+    "[data-testid^='propertyCard-'] a.propertyCard-link",
 ]
 
 # ---------- Helpers ----------
@@ -140,7 +143,23 @@ def extract_detail(url: str) -> Dict:
         "garden": None,
         "key_features": None,
     }
+    
+    def dd_text(soup: BeautifulSoup, label_contains: str) -> Optional[str]:
+        label_u = label_contains.upper()
+        for dt in soup.select("dt"):
+            key = dt.get_text(strip=True).upper()
+            if label_u in key:
+                dd = dt.find_next_sibling("dd")
+                if dd:
+                    p = dd.find("p")
+                    if p:
+                        return p.get_text(" ", strip=True) or None
+                    # join all text in dd to preserve numbers split across lines
+                    return " ".join(list(dd.stripped_strings)) or None
+        return None
+
     try:
+        # property id from URL
         m = re.search(r"/properties/(\d+)", url)
         if m:
             result["property_id"] = m.group(1)
@@ -148,27 +167,95 @@ def extract_detail(url: str) -> Dict:
         r.raise_for_status()
         html = r.text
         soup = BeautifulSoup(html, "html.parser")
-        # price
-        price_el = soup.select_one("[data-testid='price']") or soup.select_one(".property-header-price")
+
+        # price (include sitemap hint selector)
+        price_el = (
+            soup.select_one("[itemtype='https://schema.org/Residence'] div article div div div > span:nth-of-type(1)")
+            or soup.select_one("[itemtype='https://schema.org/Residence'] span:nth-of-type(1)")
+            or soup.select_one("[data-testid='price']")
+            or soup.select_one(".property-header-price")
+            or soup.select_one(".property-header__price")
+            or soup.select_one("[data-test='price']")
+        )
         if price_el:
             result["price"] = price_el.get_text(" ", strip=True)
-        # address
-        addr_el = soup.select_one("[data-testid='address']") or soup.select_one(".address, [itemprop='address']")
+        else:
+            # fallback regex scan
+            pm = re.search(r"£\s*[\d,]+", html)
+            if pm:
+                result["price"] = pm.group(0)
+
+        # address (prefer itemprop selector per sitemap)
+        addr_el = (
+            soup.select_one("div[itemprop='address']")
+            or soup.select_one("[data-testid='address']")
+            or soup.select_one(".address, [itemprop='address']")
+        )
         if addr_el:
             result["address"] = addr_el.get_text(" ", strip=True)
-        # title-derived fields
-        title_el = soup.select_one("[data-testid='title']") or soup.select_one("h1")
-        if title_el:
-            title_text = title_el.get_text(" ", strip=True)
-            if result["bedrooms"] is None:
-                bm = re.search(r"(\d+)\s*bed", title_text, re.I)
-                if bm:
-                    result["bedrooms"] = int(bm.group(1))
-            if result["property_type"] is None:
-                tm = re.search(r"\b(Detached|Semi[- ]?Detached|End of Terrace|Terraced|Flat|Apartment|Bungalow|Cottage|Townhouse)\b", title_text, re.I)
-                if tm:
-                    result["property_type"] = tm.group(1).replace("-", " ").title()
-        # features
+
+        # dd-based fields
+        if result["property_type"] is None:
+            t = dd_text(soup, "PROPERTY TYPE")
+            if t:
+                result["property_type"] = t
+        if result["bedrooms"] is None:
+            b = dd_text(soup, "BEDROOMS")
+            if b:
+                result["bedrooms"] = first_int(b)
+        if result["bathrooms"] is None:
+            bth = dd_text(soup, "BATHROOMS")
+            if bth:
+                result["bathrooms"] = first_int(bth)
+
+        # size via multiple possible labels
+        size_text = (
+            dd_text(soup, "SIZE")
+            or dd_text(soup, "FLOOR AREA")
+            or dd_text(soup, "FLOOR-AREA")
+        )
+        if size_text:
+            m2 = SQM_PATTERN.search(size_text)
+            ft2 = SQFT_PATTERN.search(size_text)
+            if m2:
+                result["size_sq_m"] = m2.group(1).replace(",", "")
+            if ft2:
+                result["size_sq_ft"] = ft2.group(1).replace(",", "")
+        
+        # JSON-LD fallback for floor size
+        if result["size_sq_m"] is None or result["size_sq_ft"] is None:
+            try:
+                for script in soup.select('script[type="application/ld+json"]'):
+                    try:
+                        data = json.loads(script.get_text(strip=True))
+                    except Exception:
+                        continue
+                    nodes = data if isinstance(data, list) else [data]
+                    for node in nodes:
+                        if isinstance(node, dict):
+                            fs = node.get("floorSize")
+                            if isinstance(fs, dict):
+                                val = fs.get("value") or fs.get("area")
+                                unit = (fs.get("unitText") or fs.get("unitCode") or "").lower()
+                                if val:
+                                    if ("m" in unit or "metre" in unit) and result["size_sq_m"] is None:
+                                        result["size_sq_m"] = str(val).replace(",", "")
+                                    if ("ft" in unit or "feet" in unit) and result["size_sq_ft"] is None:
+                                        result["size_sq_ft"] = str(val).replace(",", "")
+            except Exception:
+                pass
+
+        # brute-force regex scan over full HTML text if still missing
+        if result["size_sq_ft"] is None:
+            mft = re.search(r"([0-9,.]+)\s*(sq\s*ft|sqft|square\s*feet)\b", html, re.I)
+            if mft:
+                result["size_sq_ft"] = mft.group(1).replace(",", "")
+        if result["size_sq_m"] is None:
+            mm = re.search(r"([0-9,.]+)\s*(sq\s*m|sqm|square\s*metres?)\b", html, re.I)
+            if mm:
+                result["size_sq_m"] = mm.group(1).replace(",", "")
+
+        # key features from article UL and similar
         feats = []
         for ul_sel in ["ul.key-features", "ul.property-features", "ul[data-test='key-features']", "article ul"]:
             for ul in soup.select(ul_sel):
@@ -182,18 +269,61 @@ def extract_detail(url: str) -> Dict:
                 if f not in seen:
                     seen.add(f); ordered.append(f)
             result["key_features"] = "; ".join(ordered)
-        # tenure / council tax via dt/dd pairs
-        for dt in soup.select("dt"):
-            key = dt.get_text(strip=True).upper()
-            dd = dt.find_next_sibling("dd")
-            if not dd:
-                continue
-            val = dd.get_text(" ", strip=True)
-            if "TENURE" in key and not result["tenure"]:
-                result["tenure"] = val
-            if "COUNCIL TAX" in key and not result["council_tax_band"]:
-                m2 = re.search(r"Band\s*:?\s*([A-H])", val, re.I)
-                result["council_tax_band"] = (m2.group(1).upper() if m2 else val)
+
+
+
+        # tenure / council tax / parking / garden
+        if result["tenure"] is None:
+            ten = dd_text(soup, "TENURE")
+            if ten:
+                result["tenure"] = ten
+        if result["council_tax_band"] is None:
+            ct = dd_text(soup, "COUNCIL TAX")
+            if ct:
+                mct = re.search(r"Band\s*:?\s*([A-H])", ct, re.I)
+                result["council_tax_band"] = (mct.group(1).upper() if mct else ct)
+        if result["parking"] is None:
+            pk = dd_text(soup, "PARKING")
+            if pk:
+                result["parking"] = "Yes" if re.search(r"yes|private|drive|garage|off[- ]road|parking", pk, re.I) else pk
+        if result["garden"] is None:
+            gd = dd_text(soup, "GARDEN")
+            if gd:
+                result["garden"] = "Yes" if re.search(r"yes|garden|yard|balcony|terrace", gd, re.I) else gd
+
+        # title-derived fallbacks
+        title_el = soup.select_one("[data-testid='title']") or soup.select_one("h1")
+        if title_el:
+            title_text = title_el.get_text(" ", strip=True)
+            if result["bedrooms"] is None:
+                bm = re.search(r"(\d+)\s*bed", title_text, re.I)
+                if bm:
+                    result["bedrooms"] = int(bm.group(1))
+            if result["property_type"] is None:
+                tm = re.search(r"\b(Detached|Semi[- ]?Detached|End of Terrace|Terraced|Flat|Apartment|Bungalow|Cottage|Townhouse)\b", title_text, re.I)
+                if tm:
+                    result["property_type"] = tm.group(1).replace("-", " ").title()
+
+        # fact chips for beds/baths/sizes
+        facts = [el.get_text(" ", strip=True) for el in soup.select("[data-testid='rounded-fact'], .key-fact, .fact")]
+        for fact in facts:
+            if result["bedrooms"] is None:
+                mbed = re.search(r"(\d+)\s*bed", fact, re.I)
+                if mbed:
+                    result["bedrooms"] = int(mbed.group(1))
+            if result["bathrooms"] is None:
+                mbath = re.search(r"(\d+)\s*bath", fact, re.I)
+                if mbath:
+                    result["bathrooms"] = int(mbath.group(1))
+            if result["size_sq_ft"] is None:
+                mft = SQFT_PATTERN.search(fact)
+                if mft:
+                    result["size_sq_ft"] = mft.group(1).replace(",", "")
+            if result["size_sq_m"] is None:
+                mm = SQM_PATTERN.search(fact)
+                if mm:
+                    result["size_sq_m"] = mm.group(1).replace(",", "")
+
         return result
     except Exception:
         return result
@@ -242,38 +372,61 @@ def load_outcodes() -> List[str]:
     raise ValueError("Could not find an outcode column in outward_postcodes.csv")
 
 
-# ---------- Run full scrape ----------
-OUTCODES = load_outcodes()
-print(f"Total outcodes to scrape: {len(OUTCODES)}")
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="Scrape Rightmove properties by outward postcode (outcode)")
+    parser.add_argument(
+        "--outcodes",
+        help="Comma-separated list of outcodes to scrape (e.g. 'WR7' or 'B93,B92')",
+        default=None,
+    )
+    parser.add_argument(
+        "--max-pages",
+        type=int,
+        default=200,
+        help="Max pages per outcode (24 results per page)",
+    )
+    parser.add_argument(
+        "--output",
+        default="rm_wm_property.csv",
+        help="Output CSV path",
+    )
+    args = parser.parse_args(argv)
 
-all_frames: List[pd.DataFrame] = []
-for i, oc in enumerate(OUTCODES, 1):
-    print(f"\n[{i}/{len(OUTCODES)}] OUTCODE {oc}")
-    df = paginate_outcode(oc, max_pages=200)
-    if df.empty:
-        continue
-    df["outcode"] = oc
-    # Derive outward from address if present
-    if "address" in df.columns:
-        df["district"] = df["address"].apply(extract_outward_postcode)
+    if args.outcodes:
+        OUTCODES = [oc.strip().upper().replace(" ", "") for oc in args.outcodes.split(",") if oc.strip()]
     else:
-        df["district"] = oc
-    all_frames.append(df)
+        OUTCODES = load_outcodes()
 
-if all_frames:
+    print(f"Total outcodes to scrape: {len(OUTCODES)}")
+
+    all_frames: List[pd.DataFrame] = []
+    for i, oc in enumerate(OUTCODES, 1):
+        print(f"\n[{i}/{len(OUTCODES)}] OUTCODE {oc}")
+        df = paginate_outcode(oc, max_pages=args.max_pages)
+        if df.empty:
+            continue
+        df["outcode"] = oc
+        all_frames.append(df)
+
+    if not all_frames:
+        print("No data scraped.")
+        return 1
+
     results_df = pd.concat(all_frames, ignore_index=True)
     if "property_id" in results_df.columns:
         results_df = results_df.drop_duplicates(subset=["property_id"])  # dedupe
-    # Insert outcode after property_id if both exist
     cols = list(results_df.columns)
     if "outcode" in cols and "property_id" in cols:
         cols.remove("outcode")
         insert_at = cols.index("property_id") + 1
         cols.insert(insert_at, "outcode")
         results_df = results_df[cols]
-    out_path = "rm_wm_property.csv"
+    out_path = args.output
     results_df.to_csv(out_path, index=False)
     print(f"Saved -> {out_path} ({len(results_df)} rows)")
-else:
-    print("No data scraped.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
 
